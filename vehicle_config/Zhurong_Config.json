@@ -1,0 +1,70 @@
+{
+  "max_steer_angle_deg": 85,
+  "wheel_rel_pos": {
+    "lf": [0.775, 0.642, -0.354],
+    "rf": [0.775, -0.642, -0.354],
+    "lm": [0.0, 0.642, -0.354],
+    "rm": [0.0, -0.642, -0.354],
+    "lb": [-0.775, 0.642, -0.354],
+    "rb": [-0.775, -0.642, -0.354]
+  },
+  "steering_upright_pos": {
+    "lf": [0.775, 0.700, -0.201],
+    "rf": [0.775, -0.700, -0.201],
+    "lm": [0.0, 0.700, -0.201],
+    "rm": [0.0, -0.700, -0.201],
+    "lb": [-0.775, 0.700, -0.201],
+    "rb": [-0.775, -0.700, -0.201]
+  },
+  "steer_motor_loc": {
+    "lf": [0.775, 0.652, 0.1465],
+    "rf": [0.775, -0.652, -0.1035],
+    "lm": [0.0, 0.652, 0.1465],
+    "rm": [0.0, -0.652, -0.1035],
+    "lb": [-0.775, 0.652, 0.1465],
+    "rb": [-0.775, -0.652, -0.1035]
+  },
+  "rocker_pos": {
+    "lf": [0.376, 0.513, -0.105],
+    "rf": [0.376, -0.513, -0.105],
+    "lm": [-0.304, 0.575, -0.143],
+    "rm": [-0.304, -0.575, -0.143],
+    "lb": [-0.388, 0.650, -0.141],
+    "rb": [-0.388, -0.650, -0.141]
+  },
+  "rocker_motor_loc": {
+    "front_l": [0.0, 0.450, -0.1045],
+    "front_r": [0.0, -0.450, -0.1045],
+    "rear_l": [0.0, 0.4955, -0.1045],
+    "rear_r": [0.0, -0.4955, -0.1045],
+    "sub_l": [-0.3875, 0.654195, -0.154432],
+    "sub_r": [-0.3875, -0.654195, -0.154432]
+  },
+  "obj_paths": {
+    "chassis": "Zhurong/Chassis.obj",
+    "wheels": {
+      "lf": "Zhurong/LFWheel.obj",
+      "rf": "Zhurong/RFWheel.obj",
+      "lm": "Zhurong/LMWheel.obj",
+      "rm": "Zhurong/RMWheel.obj",
+      "lb": "Zhurong/LRWheel.obj",
+      "rb": "Zhurong/RRWheel.obj"
+    },
+    "rockers": {
+      "lf": "Zhurong/LMainRocker_Front.obj",
+      "rf": "Zhurong/RMainRocker_Front.obj",
+      "lm": "Zhurong/LMainRocker_Rear.obj",
+      "rm": "Zhurong/RMainRocker_Rear.obj",
+      "lb": "Zhurong/LSubRocker.obj",
+      "rb": "Zhurong/RSubRocker.obj"
+    },
+    "uprights": {
+      "lf": "Zhurong/LFSteering.obj",
+      "rf": "Zhurong/RFSteering.obj",
+      "lm": "Zhurong/LMSteering.obj",
+      "rm": "Zhurong/RMSteering.obj",
+      "lb": "Zhurong/LRSteering.obj",
+      "rb": "Zhurong/RRSteering.obj"
+    }
+  }
+}
