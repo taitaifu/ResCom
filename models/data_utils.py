@@ -14,6 +14,11 @@ from torch.utils.data import Dataset
 
 WHEEL_IDS = list(range(6))
 
+# 摇臂节点名称直接使用 CSV 中 susp_rocker_ 后面的部件编码。
+# 注意：列名前缀 lf_ 表示 low fidelity；susp_rocker_lf/lm/lb 中的 lf/lm/lb 才表示摇臂部件。
+ROCKER_NAMES = ["lf", "lm", "lb", "rf", "rm", "rb"]
+ROCKER_NAME_SET = set(ROCKER_NAMES)
+
 def load_column_list(csv_path: str) -> List[str]: # 加载列名.CSV文件
     df = pd.read_csv(csv_path)
     if df.shape[1] != 1:
@@ -30,6 +35,29 @@ def get_wheel_id(col: str) -> Optional[int]: # 判断是不是车轮列，是则
 
 def is_wheel_col(col: str) -> bool: # 判断是不是车轮列，返回的是布尔值
     return get_wheel_id(col) is not None
+
+
+def get_rocker_name(col: str) -> Optional[str]:
+    """
+    根据 CSV 列名识别摇臂部件，并直接返回 susp_rocker_ 后面的编码。
+
+    示例：
+        lf_susp_rocker_lf_pos_x -> lf
+        lf_susp_rocker_lm_vel_x -> lm
+        lf_susp_rocker_lb_acc_x -> lb
+
+    其中列名前缀 lf_ 表示低保真，susp_rocker_ 后面的 lf/lm/lb/rf/rm/rb 表示摇臂部件编码。
+    """
+    m = re.search(r"(?:^|_)susp_rocker_([a-z]{2})(?:_|$)", col)
+    if not m:
+        return None
+    code = m.group(1)
+    return code if code in ROCKER_NAME_SET else None
+
+
+def is_rocker_col(col: str) -> bool:
+    """判断列名是否属于摇臂状态列。"""
+    return get_rocker_name(col) is not None
 
 
 def has_any_keyword(col: str, keywords: List[str]) -> bool: # 判断列名是否包含任意关键字
@@ -50,10 +78,20 @@ def check_columns_exist(df: pd.DataFrame, columns: List[str], name: str) -> None
 # 车身基础状态
 BODY_BASE_KEYWORDS = [
     "_pos_", "_vel_", "_acc_", "_roll", "_sin_yaw", "_pitch", "_cos_yaw",
+    "_q0", "_q1", "_q2", "_q3", "_q4",
 ]
 # 车轮基础运动学特征
 WHEEL_BASE_KIN_KEYWORDS = [
     "_pos_", "_vel_", "_acc_", "_roll", "_sin_yaw", "_pitch", "_cos_yaw",
+    "_q0", "_q1", "_q2", "_q3", "_q4",
+]
+# 摇臂中间运动学状态。摇臂只作为输入中间量，不作为最终预测目标。
+ROCKER_BASE_KEYWORDS = [
+    "_pos_", "_vel_", "_acc_", "_roll", "_sin_yaw", "_pitch", "_cos_yaw",
+    "_q0", "_q1", "_q2", "_q3", "_q4",
+]
+ROCKER_PROXY_KEYWORDS = [
+    "_ang_vel_", "_ang_acc_",
 ]
 # 车轮基础接触特征
 WHEEL_BASE_CONTACT_KEYWORDS = [
@@ -87,13 +125,14 @@ ATTITUDE_RES_KEYWORDS = [
 ]
 # 四元数输出
 QUAT_KEYWORDS = [
-    "_q0", "_q1", "_q2", "_q3",
+    "_q0", "_q1", "_q2", "_q3", "_q4",
 ]
 
 @dataclass
 class InputGroupSpec: # 输入特征分组
     system_cols: List[str]
     body_cols: List[str]
+    rocker_cols: Dict[str, List[str]]
     wheel_kin_cols: Dict[int, List[str]]
     wheel_contact_cols: Dict[int, List[str]]
 
@@ -138,7 +177,7 @@ def is_system_col(col: str) -> bool:
     1. 不属于 wheel0-wheel5 的逐轮特征
     2. 包含 SYSTEM_GLOBAL_KEYWORDS 中的关键词
     """
-    return (not is_wheel_col(col)) and has_any_keyword(col, SYSTEM_GLOBAL_KEYWORDS)
+    return (not is_wheel_col(col)) and (not is_rocker_col(col)) and has_any_keyword(col, SYSTEM_GLOBAL_KEYWORDS)
 
 def is_body_col(col: str) -> bool:
     """
@@ -153,12 +192,28 @@ def is_body_col(col: str) -> bool:
     """
     if is_wheel_col(col):
         return False
+    if is_rocker_col(col):
+        return False
     if is_system_col(col):
         return False
     return (
         has_any_keyword(col, BODY_BASE_KEYWORDS)
         or has_any_keyword(col, BODY_PROXY_KEYWORDS)
     )
+
+def is_rocker_state_col(col: str) -> bool:
+    """
+    判断某列是否为摇臂输入状态。
+    摇臂新增的 pos、vel、acc、q0-q4 等状态只作为 HGT 中间节点输入，
+    不会进入 res_groups 或 target_groups。
+    """
+    if not is_rocker_col(col):
+        return False
+    return (
+        has_any_keyword(col, ROCKER_BASE_KEYWORDS)
+        or has_any_keyword(col, ROCKER_PROXY_KEYWORDS)
+    )
+
 
 def is_wheel_kin_col(col: str) -> bool:
     """
@@ -207,6 +262,8 @@ def is_body_output_col(col: str, prefix: str) -> bool:
     if not col.startswith(prefix):
         return False
     if is_wheel_col(col):
+        return False
+    if is_rocker_col(col):
         return False
 
     if has_any_keyword(col, BODY_BASE_KEYWORDS):
@@ -270,10 +327,17 @@ def build_input_groups(base_feature_cols: List[str], proxy_feature_cols: List[st
     system_cols = sort_columns([c for c in all_input_cols if is_system_col(c)])
     body_cols = sort_columns([c for c in all_input_cols if is_body_col(c)])
 
+    rocker_cols = {name: [] for name in ROCKER_NAMES}
     wheel_kin_cols = {i: [] for i in WHEEL_IDS}
     wheel_contact_cols = {i: [] for i in WHEEL_IDS}
 
     for c in all_input_cols:
+        rocker_name = get_rocker_name(c)
+        if rocker_name is not None:
+            if is_rocker_state_col(c):
+                rocker_cols[rocker_name].append(c)
+            continue
+
         wid = get_wheel_id(c)
         if wid is None:
             continue
@@ -282,11 +346,13 @@ def build_input_groups(base_feature_cols: List[str], proxy_feature_cols: List[st
         elif is_wheel_contact_col(c):
             wheel_contact_cols[wid].append(c)
 
+    for name in ROCKER_NAMES:
+        rocker_cols[name] = sort_columns(rocker_cols[name])
     for i in WHEEL_IDS:
         wheel_kin_cols[i] = sort_columns(wheel_kin_cols[i])
         wheel_contact_cols[i] = sort_columns(wheel_contact_cols[i])
 
-    return InputGroupSpec(system_cols, body_cols, wheel_kin_cols, wheel_contact_cols)
+    return InputGroupSpec(system_cols, body_cols, rocker_cols, wheel_kin_cols, wheel_contact_cols)
 
 
 def build_output_groups(cols: List[str], prefix: str) -> OutputGroupSpec:
@@ -337,6 +403,8 @@ def print_group_summary(spec: ColumnSpec) -> None: # 打印分组统计信息
     print("\n========== Input Groups ==========")
     print(f"system_cols      : {len(ig.system_cols)}")
     print(f"body_cols        : {len(ig.body_cols)}")
+    for name in ROCKER_NAMES:
+        print(f"{name:18s}: {len(ig.rocker_cols[name])}")
     for i in WHEEL_IDS:
         print(f"wheel{i}_kin     : {len(ig.wheel_kin_cols[i])}")
         print(f"wheel{i}_contact : {len(ig.wheel_contact_cols[i])}")
@@ -535,6 +603,8 @@ def flatten_group_columns(spec: ColumnSpec) -> Dict[str, List[str]]: # 把嵌套
     ig = spec.input_groups
     out["system"] = ig.system_cols
     out["body"] = ig.body_cols
+    for name in ROCKER_NAMES:
+        out[name] = ig.rocker_cols[name]
     for i in WHEEL_IDS:
         out[f"wheel{i}_kin"] = ig.wheel_kin_cols[i]
         out[f"wheel{i}_contact"] = ig.wheel_contact_cols[i]
@@ -690,6 +760,8 @@ class GraphTemporalSequenceDataset(Dataset):
 
         for key in ["system", "body"]:
             sample[key] = torch.from_numpy(self._slice_seq(self.group_arrays[key], t_global))
+        for name in ROCKER_NAMES:
+            sample[name] = torch.from_numpy(self._slice_seq(self.group_arrays[name], t_global))
         for i in WHEEL_IDS:
             sample[f"wheel{i}_kin"] = torch.from_numpy(self._slice_seq(self.group_arrays[f"wheel{i}_kin"], t_global))
             sample[f"wheel{i}_contact"] = torch.from_numpy(self._slice_seq(self.group_arrays[f"wheel{i}_contact"], t_global))
@@ -789,6 +861,8 @@ def get_group_dims(spec: ColumnSpec) -> Dict[str, int]:
         "res_body": len(spec.res_groups.body_cols),
         "hf_body": len(spec.target_groups.body_cols),
     }
+    for name in ROCKER_NAMES:
+        dims[name] = len(spec.input_groups.rocker_cols[name])
     for i in WHEEL_IDS:
         dims[f"wheel{i}_kin"] = len(spec.input_groups.wheel_kin_cols[i])
         dims[f"wheel{i}_contact"] = len(spec.input_groups.wheel_contact_cols[i])

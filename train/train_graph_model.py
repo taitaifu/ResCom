@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1] # 根目录
 sys.path.append(str(ROOT))
 
 from models.data_utils import (  # noqa: E402
+    ROCKER_NAMES,
     WHEEL_IDS,
     get_group_dims,
     graph_temporal_collate_fn,
@@ -38,6 +39,14 @@ from models.graph_temporal_compensation import (  # noqa: E402
     smoothness_loss
 )
 
+from models.graph_temporal_hgt_compensation import (  # noqa: E402
+    GraphTemporalHGTCompensationModel,
+    apply_rotvec_to_quat,
+    huber_or_mse,
+    quat_geodesic_loss,
+    finite_diff_consistency_loss,
+    smoothness_loss
+)
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -1010,7 +1019,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature_dir", type=str, default=str(ROOT / "Feature_Selection" / "DataSet"))
     parser.add_argument("--merged_csv", type=str, default=str(ROOT / "Feature_Selection" / "DataSet" / "merged_error_dataset.csv"))
-    parser.add_argument("--save_dir", type=str, default=str(ROOT / "results" / "graph_temporal"))
+    parser.add_argument("--save_dir", type=str, default=str(ROOT / "results" / "hgt_graph_temporal"))
     parser.add_argument("--log_dir", type=str, default=None, help="TensorBoard 日志目录，默认保存到 save_dir/tensorboard")
     parser.add_argument("--seq_len", type=int, default=60)
     parser.add_argument("--pred_horizon", type=int, default=0)
@@ -1092,7 +1101,12 @@ def main():
         )
 
     group_dims = get_group_dims(spec)
-    model = GraphTemporalCompensationModel(
+
+    # rocker_dims = {name: group_dims.get(name, 0) for name in ROCKER_NAMES}
+    # print("Rocker input dims:", rocker_dims)
+    # writer.add_text("config/rocker_dims", json.dumps(rocker_dims, ensure_ascii=False, indent=2), 0)
+
+    model = GraphTemporalHGTCompensationModel(
         group_dims=group_dims,
         node_hidden_dim=args.hidden_dim,
         graph_layers=args.graph_layers,
