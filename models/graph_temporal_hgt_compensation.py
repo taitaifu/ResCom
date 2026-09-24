@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -86,7 +87,165 @@ class ResidualHead(nn.Module):
         return self.net(x)
 
 
-def build_hgt_vehicle_graph(include_self_loops: bool = True) -> Tuple[Dict[str, int], List[str], torch.Tensor, torch.Tensor, List[str]]:
+class RelationGateMLP(nn.Module):
+    """根据全局图状态生成 relation gate。"""
+
+    def __init__(
+        self,
+        in_dim: int,
+        num_relations: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_relations),
+            nn.Sigmoid(),
+        )
+        self._init_neutral_gate_head()
+
+    def _init_neutral_gate_head(self) -> None:
+        # 让 gate 在首次启用时稳定落在 0.5，避免随机初始化立即扰动已训练好的 base 模型。
+        last_linear = next(module for module in reversed(self.net) if isinstance(module, nn.Linear))
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).clamp(1e-4, 1.0)
+
+
+@dataclass(frozen=True)
+class EdgeSpec:
+    # src_name / dst_name: 这条边两端的节点名。
+    src_name: str
+    # relation_name: 这条边所属的关系类型字符串。
+    dst_name: str
+    # relation_id: 这条边所属的关系类型编号，和 edge_type 对齐。
+    relation_name: str
+    relation_id: int
+
+
+class EdgeGateMLP(nn.Module):
+    """将关系相关的边特征映射为逐边 gate。"""
+
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 64, dropout: float = 0.0):
+        super().__init__()
+        # in_dim 是当前关系对应的物理边特征维度。
+        self.in_dim = int(in_dim)
+        if self.in_dim <= 0:
+            # 没有有效物理特征时，不构建 MLP，由上层逻辑兜底。
+            self.net = None
+        else:
+            # 输出 out_dim 个 gate；在当前实现里 out_dim = num_heads。
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, out_dim),
+                nn.Sigmoid(),
+            )
+            self._init_neutral_gate_head()
+
+    def _init_neutral_gate_head(self) -> None:
+        if self.net is None:
+            return
+        # 让逐边 gate 的默认输出为 0.5，对应 attention 的中性倍率 1.0。
+        last_linear = next(module for module in reversed(self.net) if isinstance(module, nn.Linear))
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.net is None:
+            raise RuntimeError("EdgeGateMLP 收到空输入维度，请检查关系特征配置。")
+        return self.net(x)
+
+
+class TeacherGateNet(nn.Module):
+    """训练阶段使用高保真/残差摘要生成教师 relation gate。"""
+
+    def __init__(
+        self,
+        in_dim: int,
+        num_relations: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_relations),
+            nn.Sigmoid(),
+        )
+        self._init_neutral_gate_head()
+
+    def _init_neutral_gate_head(self) -> None:
+        # 教师 gate 也从 0.5 起步，避免蒸馏一开始就强推某种关系分布。
+        last_linear = next(module for module in reversed(self.net) if isinstance(module, nn.Linear))
+        nn.init.zeros_(last_linear.weight)
+        nn.init.zeros_(last_linear.bias)
+
+    def forward(self, summary: torch.Tensor) -> torch.Tensor:
+        # 教师 gate 永远压到稳定区间，避免蒸馏或取 log 时数值不稳。
+        return self.net(summary).clamp(1e-4, 1.0)
+
+
+class StudentGateSummaryNet(nn.Module):
+    """根据学生可见的全局状态预测教师侧全局摘要参数。"""
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim),
+            nn.Softplus(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def strength_to_gate(strength: torch.Tensor, scale: float = 1.5) -> torch.Tensor:
+    return (1.0 - torch.exp(-scale * strength)).clamp(1e-4, 1.0)
+
+
+def gate_to_attention_multiplier(gate: torch.Tensor) -> torch.Tensor:
+    # gate 的数值语义保留在 [0, 1]，但 attention 里的中性点应为 0.5 而不是 1.0。
+    # 这样新启用 gate 时，默认输出不会把已训练好的消息传递整体压小一截。
+    return (1.0 + (gate - 0.5)).clamp(1e-4, 1.5)
+
+
+def build_hgt_vehicle_graph(
+    include_self_loops: bool = True,
+) -> Tuple[Dict[str, int], List[str], torch.Tensor, torch.Tensor, List[str], List[EdgeSpec]]:
     """
     构建适配 HGT 的异构车辆图。
 
@@ -132,10 +291,15 @@ def build_hgt_vehicle_graph(include_self_loops: bool = True) -> Tuple[Dict[str, 
         "state_to_target",
     ]
     rel_id = {name: i for i, name in enumerate(relation_names)}
+    # edges 存数值版边；edge_specs 存可解释的边元数据，后续 edge_gate 和日志都依赖它。
     edges: List[Tuple[int, int, int]] = []
+    edge_specs: List[EdgeSpec] = []
 
     def add(src: str, dst: str, rel: str) -> None:
+        # 数值图结构供 HGT 使用。
         edges.append((node_map[src], node_map[dst], rel_id[rel]))
+        # 可解释边结构供物理特征构造和分 relation 统计使用。
+        edge_specs.append(EdgeSpec(src_name=src, dst_name=dst, relation_name=rel, relation_id=rel_id[rel]))
 
     def add_ud(a: str, b: str, rel: str) -> None:
         add(a, b, rel)
@@ -187,7 +351,7 @@ def build_hgt_vehicle_graph(include_self_loops: bool = True) -> Tuple[Dict[str, 
 
     edge_index = torch.tensor([[s for s, _, _ in edges], [d for _, d, _ in edges]], dtype=torch.long)
     edge_type = torch.tensor([r for _, _, r in edges], dtype=torch.long)
-    return node_map, node_types, edge_index, edge_type, relation_names
+    return node_map, node_types, edge_index, edge_type, relation_names, edge_specs
 
 
 class HGTLayer(nn.Module):
@@ -224,6 +388,7 @@ class HGTLayer(nn.Module):
         self.register_buffer("node_type_ids", node_type_ids.long())
         self.register_buffer("edge_index", edge_index.long())
         self.register_buffer("edge_type", edge_type.long())
+        self.register_buffer("edge_dst_index", edge_index[1].long())
 
         self.q_proj = nn.ModuleDict({t: nn.Linear(hidden_dim, hidden_dim) for t in node_type_names})
         self.k_proj = nn.ModuleDict({t: nn.Linear(hidden_dim, hidden_dim) for t in node_type_names})
@@ -249,16 +414,32 @@ class HGTLayer(nn.Module):
     def _project_by_type(self, x: torch.Tensor, proj: nn.ModuleDict) -> torch.Tensor:
         # x: [BT, N, H]
         bt, n, _ = x.shape
-        out = x.new_zeros(bt, n, self.num_heads, self.head_dim)
+        out: Optional[torch.Tensor] = None
         for type_id, type_name in enumerate(self.node_type_names):
             idx = torch.nonzero(self.node_type_ids == type_id, as_tuple=False).flatten()
             if idx.numel() == 0:
                 continue
             projected = proj[type_name](x[:, idx, :])
+            if out is None:
+                out = torch.zeros(
+                    bt,
+                    n,
+                    self.num_heads,
+                    self.head_dim,
+                    device=x.device,
+                    dtype=projected.dtype,
+                )
             out[:, idx, :, :] = projected.view(bt, idx.numel(), self.num_heads, self.head_dim)
+        if out is None:
+            return x.new_zeros(bt, n, self.num_heads, self.head_dim)
         return out
 
-    def forward(self, x: torch.Tensor, relation_gate: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        relation_gate: Optional[torch.Tensor] = None,
+        edge_gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # x: [B, T, N, H]
         bsz, seq_len, num_nodes, hidden_dim = x.shape
         if num_nodes != self.num_nodes:
@@ -291,29 +472,68 @@ class HGTLayer(nn.Module):
         if relation_gate is not None:
             # relation_gate: [B, T, R]，每个样本和时间步对关系类型给出动态门控
             gate = relation_gate.reshape(bt, self.num_relations).clamp_min(1e-4)
-            score = score + torch.log(gate[:, rel]).unsqueeze(-1)
+            # 每条边按自己的 relation 类型取 gate，再转成对数偏置加到 score 上。
+            score = score + torch.log(gate_to_attention_multiplier(gate[:, rel])).unsqueeze(-1)
 
-        attn = score.new_zeros(bt, num_edges, self.num_heads)
-        for node_idx in range(num_nodes):
-            mask = dst == node_idx
-            if torch.any(mask):
-                attn[:, mask, :] = torch.softmax(score[:, mask, :], dim=1)
+        if edge_gate is not None:
+            if edge_gate.ndim == 3:
+                gate = edge_gate.reshape(bt, num_edges).clamp(1e-4, 1.0)
+                # [B, T, E] 情况下，所有 head 共用同一个逐边 gate。
+                score = score + torch.log(gate_to_attention_multiplier(gate)).unsqueeze(-1)
+            elif edge_gate.ndim == 4:
+                gate = edge_gate.reshape(bt, num_edges, self.num_heads).clamp(1e-4, 1.0)
+                # [B, T, E, heads] 情况下，每个 head 都有自己的逐边 gate。
+                score = score + torch.log(gate_to_attention_multiplier(gate))
+            else:
+                raise ValueError(
+                    f"edge_gate 应为 [B, T, E] 或 [B, T, E, heads]，实际 shape={tuple(edge_gate.shape)}"
+                )
+
+        # 按目标节点分组做 softmax；先做 group-wise max，再做 group-wise sum。
+        dst_index = self.edge_dst_index.view(1, num_edges, 1).expand(bt, -1, self.num_heads)
+        score_max = score.new_full((bt, num_nodes, self.num_heads), float("-inf"))
+        score_max.scatter_reduce_(1, dst_index, score, reduce="amax", include_self=True)
+        score_centered = score - score_max.gather(1, dst_index)
+        score_exp = torch.exp(score_centered)
+        score_denom = score.new_zeros(bt, num_nodes, self.num_heads)
+        score_denom.scatter_add_(1, dst_index, score_exp)
+        attn = score_exp / score_denom.gather(1, dst_index).clamp_min(1e-12)
         attn = self.dropout(attn)
 
         msg = v_rel * attn.unsqueeze(-1)
-        out = flat.new_zeros(bt, num_nodes, self.num_heads, self.head_dim)
-        for edge_pos in range(num_edges):
-            out[:, dst[edge_pos], :, :] += msg[:, edge_pos, :, :]
+        # 按目标节点把所有边消息一次性 scatter_add 回节点张量。
+        out = torch.zeros(
+            bt,
+            num_nodes,
+            self.num_heads,
+            self.head_dim,
+            device=msg.device,
+            dtype=msg.dtype,
+        )
+        dst_msg_index = self.edge_dst_index.view(1, num_edges, 1, 1).expand(bt, -1, self.num_heads, self.head_dim)
+        out.scatter_add_(1, dst_msg_index, msg)
         out = out.reshape(bt, num_nodes, hidden_dim)
 
-        updated = flat.new_empty(bt, num_nodes, hidden_dim)
+        updated: Optional[torch.Tensor] = None
         for type_id, type_name in enumerate(self.node_type_names):
             idx = torch.nonzero(self.node_type_ids == type_id, as_tuple=False).flatten()
             if idx.numel() == 0:
                 continue
             y = self.out_proj[type_name](out[:, idx, :])
             y = self.dropout(y)
-            updated[:, idx, :] = self.norm[type_name](flat[:, idx, :] + F.gelu(y))
+            normalized = self.norm[type_name](flat[:, idx, :] + F.gelu(y))
+            if updated is None:
+                updated = torch.empty(
+                    bt,
+                    num_nodes,
+                    hidden_dim,
+                    device=normalized.device,
+                    dtype=normalized.dtype,
+                )
+            updated[:, idx, :] = normalized
+
+        if updated is None:
+            return flat.reshape(bsz, seq_len, num_nodes, hidden_dim)
 
         return updated.reshape(bsz, seq_len, num_nodes, hidden_dim)
 
@@ -337,11 +557,22 @@ class HGTGraphTemporalCompensationModel(nn.Module):
         lstm_layers: int = 2,
         dropout: float = 0.1,
         enable_relation_gate: bool = True,
+        enable_edge_gate: bool = False,
+        pred_seq_len: int = 1,
+        group_columns: Optional[Dict[str, List[str]]] = None,
+        gate_summary_dim: int = 31,
     ):
         super().__init__()
         self.group_dims = group_dims
         self.node_hidden_dim = node_hidden_dim
         self.enable_relation_gate = enable_relation_gate
+        self.enable_edge_gate = enable_edge_gate
+        self.pred_seq_len = int(pred_seq_len)
+        self.gate_summary_dim = int(gate_summary_dim)
+        # group_columns 保留每个输入组的原始列名，供物理 edge feature 逐列匹配。
+        self.group_columns = group_columns or {}
+        if self.pred_seq_len < 1:
+            raise ValueError(f"pred_seq_len 必须 >= 1，实际为 {self.pred_seq_len}")
 
         self.input_encoders = nn.ModuleDict()
         self.virtual_node_embeds = nn.ParameterDict()
@@ -361,12 +592,37 @@ class HGTGraphTemporalCompensationModel(nn.Module):
             add_input_encoder(f"wheel{i}_kin", f"wheel{i}_kin", max(64, node_hidden_dim))
             add_input_encoder(f"wheel{i}_contact", f"wheel{i}_contact", max(64, node_hidden_dim))
 
-        node_map, node_types, edge_index, edge_type, relation_names = build_hgt_vehicle_graph(include_self_loops=True)
+        node_map, node_types, edge_index, edge_type, relation_names, edge_specs = build_hgt_vehicle_graph(include_self_loops=True)
         self.node_map = node_map
         self.node_types = node_types
         self.relation_names = relation_names
+        self.edge_specs = edge_specs
         self.num_nodes = len(node_map)
         self.num_relations = len(relation_names)
+        self.num_edges = len(edge_specs)
+        self.edge_gate_eps = 1e-4
+        self.control_idx = node_map["control_context"]
+        self.body_idx = node_map["body"]
+        self.rocker_indices = [node_map[name] for name in ROCKER_NAMES if name in node_map]
+        self.wheel_kin_indices = [node_map[f"wheel{i}_kin"] for i in WHEEL_IDS if f"wheel{i}_kin" in node_map]
+        self.wheel_contact_indices = [node_map[f"wheel{i}_contact"] for i in WHEEL_IDS if f"wheel{i}_contact" in node_map]
+        self.observed_indices = [self.control_idx, self.body_idx] + self.rocker_indices + self.wheel_kin_indices + self.wheel_contact_indices
+        self.relation_gate_context_dim = node_hidden_dim * 5
+        self.graph_readout_dim = node_hidden_dim * 4
+        # 把图节点名映射回 batch key，后面用它从 batch 中取该节点对应的 LF 输入。
+        self.node_to_batch_key = {"control_context": "system", "body": "body"}
+        self.node_to_batch_key.update({name: name for name in ROCKER_NAMES})
+        self.node_to_batch_key.update({f"wheel{i}_kin": f"wheel{i}_kin" for i in WHEEL_IDS})
+        self.node_to_batch_key.update({f"wheel{i}_contact": f"wheel{i}_contact" for i in WHEEL_IDS})
+        self.node_to_batch_key.update({f"target_error_wheel{i}_kin": None for i in WHEEL_IDS})
+        self.node_to_batch_key.update({f"target_error_wheel{i}_contact": None for i in WHEEL_IDS})
+        self.node_to_batch_key["target_error_body"] = None
+        self.target_error_to_res_batch_key = {"target_error_body": "res_body"}
+        self.target_error_to_res_batch_key.update({f"target_error_wheel{i}_kin": f"res_wheel{i}_kin" for i in WHEEL_IDS})
+        self.target_error_to_res_batch_key.update({f"target_error_wheel{i}_contact": f"res_wheel{i}_contact" for i in WHEEL_IDS})
+        self.relation_to_edge_positions: Dict[str, List[int]] = {}
+        for edge_pos, edge_spec in enumerate(edge_specs):
+            self.relation_to_edge_positions.setdefault(edge_spec.relation_name, []).append(edge_pos)
 
         unique_node_types = []
         for t in node_types:
@@ -392,17 +648,63 @@ class HGTGraphTemporalCompensationModel(nn.Module):
 
         if enable_relation_gate:
             self.relation_gate_layers = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(node_hidden_dim, node_hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(node_hidden_dim, self.num_relations),
-                    nn.Sigmoid(),
+                RelationGateMLP(
+                    in_dim=self.relation_gate_context_dim,
+                    num_relations=self.num_relations,
+                    hidden_dim=max(64, node_hidden_dim * 2),
+                    dropout=dropout,
                 )
                 for _ in range(graph_layers)
             ])
         else:
             self.relation_gate_layers = nn.ModuleList([nn.Identity() for _ in range(graph_layers)])
+
+        student_gate_hidden_dim = max(64, node_hidden_dim * 2)
+        self.student_summary_predictor = StudentGateSummaryNet(
+            in_dim=self.relation_gate_context_dim,
+            out_dim=self.gate_summary_dim,
+            hidden_dim=student_gate_hidden_dim,
+            dropout=dropout,
+        )
+        self.student_summary_gate_net = TeacherGateNet(
+            in_dim=self.gate_summary_dim,
+            num_relations=self.num_relations,
+            hidden_dim=student_gate_hidden_dim,
+            dropout=dropout,
+        )
+
+        self.edge_feature_dims = {
+            # 这几类关系使用显式物理边特征。
+            "kinematic_transfer": 9,
+            "motion_to_contact": 11,
+            "contact_to_motion": 11,
+            "longitudinal_coupling": 10,
+            "lateral_coupling": 10,
+        }
+        # 这几类关系不用显式物理差分，直接由源节点隐藏状态生成 gate。
+        self.hidden_gate_relations = {"control_excitation", "state_to_target"}
+        if self.enable_edge_gate:
+            self.edge_gate_feature_mlps = nn.ModuleDict({
+                rel_name: EdgeGateMLP(
+                    in_dim=feat_dim,
+                    out_dim=hgt_heads,
+                    hidden_dim=max(32, node_hidden_dim),
+                    dropout=dropout,
+                )
+                for rel_name, feat_dim in self.edge_feature_dims.items()
+            })
+            self.edge_gate_hidden_mlps = nn.ModuleDict({
+                rel_name: EdgeGateMLP(
+                    in_dim=node_hidden_dim,
+                    out_dim=hgt_heads,
+                    hidden_dim=max(32, node_hidden_dim),
+                    dropout=dropout,
+                )
+                for rel_name in self.hidden_gate_relations
+            })
+        else:
+            self.edge_gate_feature_mlps = nn.ModuleDict()
+            self.edge_gate_hidden_mlps = nn.ModuleDict()
 
         fused_dim = self.num_nodes * node_hidden_dim
         self.tcn = TemporalConvBlock(fused_dim, tcn_hidden_dim, kernel_size=3, dropout=dropout)
@@ -416,10 +718,302 @@ class HGTGraphTemporalCompensationModel(nn.Module):
         )
 
         temporal_dim = lstm_hidden_dim
-        head_in_dim = temporal_dim + node_hidden_dim
-        self.body_head = ResidualHead(head_in_dim, group_dims["res_body"], hidden_dim=128, dropout=dropout)
-        self.wheel_head = ResidualHead(head_in_dim, group_dims["res_wheel0_kin"], hidden_dim=128, dropout=dropout)
-        self.contact_head = ResidualHead(head_in_dim, group_dims["res_wheel0_contact"], hidden_dim=128, dropout=dropout)
+        self.horizon_embed = nn.Parameter(torch.zeros(self.pred_seq_len, temporal_dim))
+        head_in_dim = temporal_dim + node_hidden_dim + self.graph_readout_dim
+        head_hidden_dim = max(192, node_hidden_dim * 2)
+        self.body_head = ResidualHead(head_in_dim, group_dims["res_body"], hidden_dim=head_hidden_dim, dropout=dropout)
+        self.wheel_head = ResidualHead(head_in_dim, group_dims["res_wheel0_kin"], hidden_dim=head_hidden_dim, dropout=dropout)
+        self.contact_head = ResidualHead(head_in_dim, group_dims["res_wheel0_contact"], hidden_dim=head_hidden_dim, dropout=dropout)
+
+    def _get_group_cols(self, group_name: str) -> List[str]:
+        # 返回该输入组的列名列表；不存在时返回空列表而不是报错。
+        return list(self.group_columns.get(group_name, []))
+
+    def _get_node_tensor_and_cols(
+        self,
+        batch: Dict[str, torch.Tensor],
+        node_name: str,
+    ) -> Tuple[Optional[torch.Tensor], List[str]]:
+        batch_key = self.node_to_batch_key.get(node_name)
+        if batch_key is None or batch_key not in batch:
+            # target_error 节点或缺失输入节点不直接参与物理列匹配。
+            return None, []
+        return batch[batch_key], self._get_group_cols(batch_key)
+
+    def _zero_feature(self, ref: torch.Tensor, feat_dim: int) -> torch.Tensor:
+        # 所有缺失列、缺失节点或不适用关系都统一补零，保证前向安全。
+        return ref.new_zeros(ref.shape[0], ref.shape[1], feat_dim)
+
+    def _find_suffix_index(self, cols: List[str], suffix: str) -> Optional[int]:
+        # 按列后缀匹配物理量，例如 pos_x / slip_long / Fz。
+        for idx, col in enumerate(cols):
+            if col.endswith(suffix):
+                return idx
+        return None
+
+    def _stack_named_features(
+        self,
+        tensor: Optional[torch.Tensor],
+        cols: List[str],
+        suffixes: List[str],
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        values: List[torch.Tensor] = []
+        for suffix in suffixes:
+            if tensor is None:
+                # 整个节点输入缺失时，该物理量直接补零。
+                values.append(ref.new_zeros(ref.shape[0], ref.shape[1]))
+                continue
+            idx = self._find_suffix_index(cols, suffix)
+            if idx is None:
+                # 某一列缺失时只补当前维，不影响其他物理量。
+                values.append(ref.new_zeros(ref.shape[0], ref.shape[1]))
+            else:
+                values.append(tensor[..., idx])
+        return torch.stack(values, dim=-1)
+
+    def _stack_delta_features(
+        self,
+        src_tensor: Optional[torch.Tensor],
+        src_cols: List[str],
+        dst_tensor: Optional[torch.Tensor],
+        dst_cols: List[str],
+        suffixes: List[str],
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        values: List[torch.Tensor] = []
+        for suffix in suffixes:
+            if src_tensor is None or dst_tensor is None:
+                # 任一端节点输入缺失时，该差分物理量补零。
+                values.append(ref.new_zeros(ref.shape[0], ref.shape[1]))
+                continue
+            src_idx = self._find_suffix_index(src_cols, suffix)
+            dst_idx = self._find_suffix_index(dst_cols, suffix)
+            if src_idx is None or dst_idx is None:
+                # 源端或目标端任一列不存在时，不抛错，直接补零。
+                values.append(ref.new_zeros(ref.shape[0], ref.shape[1]))
+            else:
+                # 差分方向固定为 src - dst，保持每条有向边的物理方向性。
+                values.append(src_tensor[..., src_idx] - dst_tensor[..., dst_idx])
+        return torch.stack(values, dim=-1)
+
+    def _build_kinematic_transfer_features(
+        self,
+        batch: Dict[str, torch.Tensor],
+        edge_spec: EdgeSpec,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        suffixes = [
+            # 车身-摇臂、摇臂-车轮运动链只使用运动学差分。
+            "pos_x", "pos_y", "pos_z",
+            "vel_x", "vel_y", "vel_z",
+            "acc_x", "acc_y", "acc_z",
+        ]
+        src_tensor, src_cols = self._get_node_tensor_and_cols(batch, edge_spec.src_name)
+        dst_tensor, dst_cols = self._get_node_tensor_and_cols(batch, edge_spec.dst_name)
+        return self._stack_delta_features(src_tensor, src_cols, dst_tensor, dst_cols, suffixes, ref)
+
+    def _build_contact_exchange_features(
+        self,
+        batch: Dict[str, torch.Tensor],
+        edge_spec: EdgeSpec,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        suffixes = [
+            "Fx", "Fy", "Fz",
+            "Mx", "My", "Mz",
+            "slip_long", "slip_lat",
+            "sinkage", "in_contact", "contact_switch",
+        ]
+        # motion/contact 双向耦合都只看对应车轮的 contact 输入，不混入其他轮信息。
+        contact_node = edge_spec.dst_name if edge_spec.dst_name.endswith("_contact") else edge_spec.src_name
+        contact_tensor, contact_cols = self._get_node_tensor_and_cols(batch, contact_node)
+        return self._stack_named_features(contact_tensor, contact_cols, suffixes, ref)
+
+    def _build_coupling_features(
+        self,
+        batch: Dict[str, torch.Tensor],
+        edge_spec: EdgeSpec,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        feat = self._zero_feature(ref, 10)
+        src_tensor, src_cols = self._get_node_tensor_and_cols(batch, edge_spec.src_name)
+        dst_tensor, dst_cols = self._get_node_tensor_and_cols(batch, edge_spec.dst_name)
+
+        if edge_spec.src_name.endswith("_kin") and edge_spec.dst_name.endswith("_kin"):
+            # 运动学节点之间优先使用速度/加速度差异。
+            kin_suffixes = ["vel_x", "vel_y", "vel_z", "acc_x", "acc_y", "acc_z"]
+            feat[..., :6] = self._stack_delta_features(src_tensor, src_cols, dst_tensor, dst_cols, kin_suffixes, ref)
+        elif edge_spec.src_name.endswith("_contact") and edge_spec.dst_name.endswith("_contact"):
+            # 接触节点之间优先使用接触状态差异。
+            contact_suffixes = ["Fx", "Fy", "Fz", "Mx", "My", "Mz", "slip_long", "slip_lat", "sinkage", "in_contact"]
+            feat[...] = self._stack_delta_features(src_tensor, src_cols, dst_tensor, dst_cols, contact_suffixes, ref)
+        return feat
+
+    def _build_physical_edge_feature(
+        self,
+        batch: Dict[str, torch.Tensor],
+        edge_spec: EdgeSpec,
+        ref: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if edge_spec.relation_name == "kinematic_transfer":
+            return self._build_kinematic_transfer_features(batch, edge_spec, ref)
+        if edge_spec.relation_name in {"motion_to_contact", "contact_to_motion"}:
+            return self._build_contact_exchange_features(batch, edge_spec, ref)
+        if edge_spec.relation_name in {"longitudinal_coupling", "lateral_coupling"}:
+            return self._build_coupling_features(batch, edge_spec, ref)
+        return None
+
+    def _build_physical_edge_features_for_relation(
+        self,
+        batch: Dict[str, torch.Tensor],
+        relation_name: str,
+        edge_positions: List[int],
+        ref: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        features: List[torch.Tensor] = []
+        for edge_pos in edge_positions:
+            feat = self._build_physical_edge_feature(batch, self.edge_specs[edge_pos], ref)
+            if feat is None:
+                return None
+            features.append(feat)
+        if not features:
+            return None
+        # [B, T, E_rel, D_rel]
+        return torch.stack(features, dim=2)
+
+    def _mean_node_features(self, x: torch.Tensor, node_indices: List[int]) -> torch.Tensor:
+        if not node_indices:
+            return x.new_zeros(x.shape[0], x.shape[1], x.shape[-1])
+        index_tensor = torch.as_tensor(node_indices, dtype=torch.long, device=x.device)
+        return x[:, :, index_tensor, :].mean(dim=2)
+
+    def _build_relation_gate_context(self, x: torch.Tensor) -> torch.Tensor:
+        control_feat = x[:, :, self.control_idx, :]
+        body_feat = x[:, :, self.body_idx, :]
+        wheel_kin_mean = self._mean_node_features(x, self.wheel_kin_indices)
+        wheel_contact_mean = self._mean_node_features(x, self.wheel_contact_indices)
+        observed_mean = self._mean_node_features(x, self.observed_indices)
+        return torch.cat(
+            [control_feat, body_feat, wheel_kin_mean, wheel_contact_mean, observed_mean],
+            dim=-1,
+        )
+
+    def _build_graph_readout(self, node_t: torch.Tensor) -> torch.Tensor:
+        wheel_kin = self._mean_node_features(node_t.unsqueeze(1), self.wheel_kin_indices).squeeze(1)
+        wheel_contact = self._mean_node_features(node_t.unsqueeze(1), self.wheel_contact_indices).squeeze(1)
+        observed = self._mean_node_features(node_t.unsqueeze(1), self.observed_indices).squeeze(1)
+        body_feat = node_t[:, self.body_idx, :]
+        return torch.cat([body_feat, wheel_kin, wheel_contact, observed], dim=-1)
+
+    def _node_strength_over_time(
+        self,
+        batch: Dict[str, torch.Tensor],
+        node_name: str,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        tensor, _ = self._get_node_tensor_and_cols(batch, node_name)
+        if tensor is None or tensor.numel() == 0:
+            return ref.new_zeros(ref.shape[0], ref.shape[1])
+        return tensor.abs().mean(dim=-1)
+
+    def _build_hidden_edge_strength(
+        self,
+        batch: Dict[str, torch.Tensor],
+        edge_spec: EdgeSpec,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        src_strength = self._node_strength_over_time(batch, edge_spec.src_name, ref)
+        if edge_spec.relation_name == "control_excitation":
+            system = batch.get("system")
+            if system is None or system.numel() == 0:
+                return src_strength
+            diff_strength = ref.new_zeros(ref.shape[0], ref.shape[1])
+            if system.shape[1] > 1:
+                diff_strength[:, 1:] = (system[:, 1:] - system[:, :-1]).abs().mean(dim=-1)
+            return 0.6 * src_strength + 0.4 * diff_strength
+        if edge_spec.relation_name == "state_to_target":
+            res_key = self.target_error_to_res_batch_key.get(edge_spec.dst_name)
+            if res_key is None or res_key not in batch:
+                return src_strength
+            res_tensor = batch[res_key]
+            if res_tensor.numel() == 0:
+                return src_strength
+            res_strength = res_tensor.abs().mean(dim=tuple(range(1, res_tensor.ndim)))
+            return src_strength * (1.0 + res_strength.unsqueeze(1))
+        return src_strength
+
+    def build_edge_distill_target(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        ref = batch["system"] if "system" in batch else batch["body"]
+        num_heads = self.hgt_layers[0].num_heads
+        edge_target = ref.new_full((ref.shape[0], ref.shape[1], self.num_edges), 0.5)
+
+        for edge_idx, edge_spec in enumerate(self.edge_specs):
+            if edge_spec.relation_name == "self_loop":
+                edge_target[:, :, edge_idx] = 1.0
+                continue
+
+            feat = self._build_physical_edge_feature(batch, edge_spec, ref)
+            if feat is not None:
+                strength = feat.abs().mean(dim=-1)
+            else:
+                strength = self._build_hidden_edge_strength(batch, edge_spec, ref)
+
+            edge_target[:, :, edge_idx] = strength_to_gate(strength)
+
+        return edge_target.unsqueeze(-1).expand(-1, -1, -1, num_heads)
+
+    def compute_edge_gate(
+        self,
+        batch: Dict[str, torch.Tensor],
+        x: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not self.enable_edge_gate:
+            # 关闭 edge_gate 时完全退回第二阶段前的逻辑。
+            return None
+
+        ref = batch["system"] if "system" in batch else batch["body"]
+        num_heads = self.hgt_layers[0].num_heads
+        edge_gate: Optional[torch.Tensor] = None
+
+        # 自环保持常数 1，不需要额外计算。
+        for rel_name, edge_positions in self.relation_to_edge_positions.items():
+            if rel_name == "self_loop":
+                continue
+
+            edge_pos_tensor = torch.as_tensor(edge_positions, dtype=torch.long, device=ref.device)
+
+            if rel_name in self.hidden_gate_relations:
+                # 同一 relation 的边一次性取出源节点隐藏状态，再批量过同一个 MLP。
+                src_indices = torch.as_tensor(
+                    [self.node_map[self.edge_specs[pos].src_name] for pos in edge_positions],
+                    dtype=torch.long,
+                    device=x.device,
+                )
+                hidden = x[:, :, src_indices, :]  # [B, T, E_rel, H]
+                gate = self.edge_gate_hidden_mlps[rel_name](hidden.reshape(-1, hidden.shape[-1]))
+                gate = gate.reshape(hidden.shape[0], hidden.shape[1], hidden.shape[2], num_heads)
+            else:
+                # 同一 relation 的物理边特征先批量构造，再一次性过该 relation 的 MLP。
+                feat = self._build_physical_edge_features_for_relation(batch, rel_name, edge_positions, ref)
+                if feat is None:
+                    continue
+                gate = self.edge_gate_feature_mlps[rel_name](feat.reshape(-1, feat.shape[-1]))
+                gate = gate.reshape(feat.shape[0], feat.shape[1], feat.shape[2], num_heads)
+
+            if edge_gate is None:
+                edge_gate = torch.full(
+                    (ref.shape[0], ref.shape[1], self.num_edges, num_heads),
+                    0.5,
+                    device=ref.device,
+                    dtype=gate.dtype,
+                )
+
+            # 按 relation 回填到全局 edge 维；这样 edge_gate 仍和 edge_index 一一对应。
+            edge_gate[:, :, edge_pos_tensor, :] = gate.clamp(self.edge_gate_eps, 1.0)
+        if edge_gate is None:
+            return None
+        return edge_gate
 
     def _encode_or_virtual(
         self,
@@ -438,7 +1032,11 @@ class HGTGraphTemporalCompensationModel(nn.Module):
         # target_error 节点没有原始输入，初始为零向量，通过 state_to_target 接收信息。
         return ref.new_zeros(ref.shape[0], ref.shape[1], self.node_hidden_dim)
 
-    def encode_nodes(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def encode_nodes(
+        self,
+        batch: Dict[str, torch.Tensor],
+        relation_gate_override: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         ref = batch["system"] if "system" in batch else batch["body"]
         encoded_by_name: Dict[str, torch.Tensor] = {}
 
@@ -472,17 +1070,49 @@ class HGTGraphTemporalCompensationModel(nn.Module):
             node_tensors[idx] = encoded_by_name[name]
         x = torch.stack(node_tensors, dim=2)
 
-        control_idx = self.node_map["control_context"]
+        # relation_gate_values 保留可反传版本，供第三阶段蒸馏使用。
+        relation_gate_values: List[torch.Tensor] = []
+        summary_values: List[torch.Tensor] = []
+        edge_gate_values: List[torch.Tensor] = []
+        # edge_gate_stats 只做日志观察，不参与额外损失。
+        edge_gate_stats: List[torch.Tensor] = []
         for layer_idx, layer in enumerate(self.hgt_layers):
-            if self.enable_relation_gate:
-                relation_gate = self.relation_gate_layers[layer_idx](x[:, :, control_idx, :])
+            if relation_gate_override is not None:
+                relation_gate = relation_gate_override
+                relation_gate_values.append(relation_gate)
+            elif self.enable_relation_gate:
+                relation_gate_context = self._build_relation_gate_context(x)
+                student_gate_summary = self.student_summary_predictor(relation_gate_context)
+                relation_gate = self.student_summary_gate_net(student_gate_summary)
+                summary_values.append(student_gate_summary)
+                relation_gate_values.append(relation_gate)
             else:
                 relation_gate = None
-            x = layer(x, relation_gate=relation_gate)
-        return x
+            edge_gate = self.compute_edge_gate(batch, x)
+            if edge_gate is not None:
+                edge_gate_values.append(edge_gate)
+                edge_gate_stats.append(edge_gate.detach())
+            x = layer(x, relation_gate=relation_gate, edge_gate=edge_gate)
+        stats: Dict[str, torch.Tensor] = {}
+        if relation_gate_values:
+            stats["student_relation_gate"] = relation_gate_values[-1]
+            stats["relation_gate_stats"] = relation_gate_values[-1].detach()
+            if summary_values:
+                stats["student_gate_summary"] = summary_values[-1]
+                stats["student_inferred_relation_gate"] = relation_gate_values[-1]
+                stats["student_inferred_relation_gate_stats"] = relation_gate_values[-1].detach()
+        if edge_gate_values:
+            stats["student_edge_gate"] = edge_gate_values[-1]
+        if edge_gate_stats:
+            stats["edge_gate_stats"] = edge_gate_stats[-1]
+        return x, stats
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        nodes = self.encode_nodes(batch)
+    def forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        relation_gate_override: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        nodes, gate_stats = self.encode_nodes(batch, relation_gate_override=relation_gate_override)
         bsz, seq_len, num_nodes, hidden_dim = nodes.shape
 
         fused = nodes.reshape(bsz, seq_len, num_nodes * hidden_dim)
@@ -490,25 +1120,33 @@ class HGTGraphTemporalCompensationModel(nn.Module):
         y, _ = self.bilstm(y)
         h_t = y[:, -1, :]
         node_t = nodes[:, -1, :, :]
+        graph_readout = self._build_graph_readout(node_t)
 
-        body_feat = torch.cat([h_t, node_t[:, self.node_map["target_error_body"], :]], dim=-1)
+        horizon_feat = h_t.unsqueeze(1) + self.horizon_embed.unsqueeze(0)
+
+        def build_target_feature(node_name: str) -> torch.Tensor:
+            node_feat = node_t[:, self.node_map[node_name], :].unsqueeze(1).expand(-1, self.pred_seq_len, -1)
+            readout_feat = graph_readout.unsqueeze(1).expand(-1, self.pred_seq_len, -1)
+            return torch.cat([horizon_feat, node_feat, readout_feat], dim=-1)
+
+        body_feat = build_target_feature("target_error_body")
         pred_body = self.body_head(body_feat)
 
         pred_wheel_kin = []
         pred_wheel_contact = []
         for i in WHEEL_IDS:
-            kin_idx = self.node_map[f"target_error_wheel{i}_kin"]
-            contact_idx = self.node_map[f"target_error_wheel{i}_contact"]
-            kin_feat = torch.cat([h_t, node_t[:, kin_idx, :]], dim=-1)
-            contact_feat = torch.cat([h_t, node_t[:, contact_idx, :]], dim=-1)
+            kin_feat = build_target_feature(f"target_error_wheel{i}_kin")
+            contact_feat = build_target_feature(f"target_error_wheel{i}_contact")
             pred_wheel_kin.append(self.wheel_head(kin_feat))
             pred_wheel_contact.append(self.contact_head(contact_feat))
 
-        return {
+        output = {
             "pred_res_body": pred_body,
             **{f"pred_res_wheel{i}_kin": pred_wheel_kin[i] for i in WHEEL_IDS},
             **{f"pred_res_wheel{i}_contact": pred_wheel_contact[i] for i in WHEEL_IDS},
         }
+        output.update(gate_stats)
+        return output
 
 
 # 兼容不同命名习惯

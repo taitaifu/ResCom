@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, asdict
@@ -26,6 +27,38 @@ def load_column_list(csv_path: str) -> List[str]: # 加载列名.CSV文件
     col = df.columns[0]
     vals = [str(x).strip() for x in df[col].tolist() if str(x).strip()]
     return vals
+
+
+def ensure_time_feature_columns(
+    df: pd.DataFrame,
+    case_col: str = "case_name",
+    time_col: str = "time",
+) -> pd.DataFrame:
+    out = df.copy()
+    if time_col not in out.columns:
+        return out
+
+    time_values = pd.to_numeric(out[time_col], errors="coerce").fillna(0.0).astype(float)
+    if "lf_time" not in out.columns:
+        out["lf_time"] = time_values
+
+    if "lf_time_norm" not in out.columns:
+        if case_col in out.columns:
+            out["lf_time_norm"] = 0.0
+            for _, idx in out.groupby(case_col, sort=False).groups.items():
+                case_times = time_values.loc[idx]
+                start = float(case_times.iloc[0]) if len(case_times) else 0.0
+                duration = float(case_times.iloc[-1] - start) if len(case_times) > 1 else 0.0
+                if duration > 1e-12:
+                    out.loc[idx, "lf_time_norm"] = (case_times - start) / duration
+                else:
+                    out.loc[idx, "lf_time_norm"] = 0.0
+        else:
+            start = float(time_values.iloc[0]) if len(time_values) else 0.0
+            duration = float(time_values.iloc[-1] - start) if len(time_values) > 1 else 0.0
+            out["lf_time_norm"] = (time_values - start) / duration if duration > 1e-12 else 0.0
+
+    return out
 
 
 def get_wheel_id(col: str) -> Optional[int]: # 判断是不是车轮列，是则返回车轮ID
@@ -98,6 +131,21 @@ WHEEL_BASE_CONTACT_KEYWORDS = [
     "_Fx", "_Fy", "_Fz", "_Mx", "_My", "_Mz", "_slip_long", "_sinkage",
 ]
 
+# 输出目标只保留关键量：
+# 1. 车身位置 xyz 和速度 xyz
+# 2. 车轮位置 xyz
+# 3. 车轮六自由度力 Fx/Fy/Fz/Mx/My/Mz
+BODY_OUTPUT_KEYWORDS = [
+    "_pos_",
+    "_vel_",
+]
+WHEEL_OUTPUT_KIN_KEYWORDS = [
+    "_pos_",
+]
+WHEEL_OUTPUT_CONTACT_KEYWORDS = [
+    "_Fx", "_Fy", "_Fz", "_Mx", "_My", "_Mz",
+]
+
 # 代理特征
 # 车身代理特征
 BODY_PROXY_KEYWORDS = [
@@ -107,6 +155,7 @@ BODY_PROXY_KEYWORDS = [
 # 系统全局特征
 SYSTEM_GLOBAL_KEYWORDS = [
     "_cmd_speed", "_sim_dt",
+    "_time",
     "_residual_", "_std", "_contact_switch",
 ]
 # 车轮运动学代理特征
@@ -266,15 +315,7 @@ def is_body_output_col(col: str, prefix: str) -> bool:
     if is_rocker_col(col):
         return False
 
-    if has_any_keyword(col, BODY_BASE_KEYWORDS):
-        return True
-
-    # 残差输出中加入姿态增量
-    if prefix == "res_" and has_any_keyword(col, ATTITUDE_RES_KEYWORDS):
-        return True
-
-    # 高保真目标中加入四元数，用于后续从 hf_q* 映射到 lf_q*
-    if prefix == "hf_" and has_any_keyword(col, QUAT_KEYWORDS):
+    if has_any_keyword(col, BODY_OUTPUT_KEYWORDS):
         return True
 
     return False
@@ -294,15 +335,7 @@ def is_wheel_output_kin_col(col: str, prefix: str) -> bool:
     if not is_wheel_col(col):
         return False
 
-    if has_any_keyword(col, WHEEL_BASE_KIN_KEYWORDS):
-        return True
-
-    # 残差输出中加入车轮姿态增量
-    if prefix == "res_" and has_any_keyword(col, ATTITUDE_RES_KEYWORDS):
-        return True
-
-    # 高保真目标中加入车轮四元数
-    if prefix == "hf_" and has_any_keyword(col, QUAT_KEYWORDS):
+    if has_any_keyword(col, WHEEL_OUTPUT_KIN_KEYWORDS):
         return True
 
     return False
@@ -319,7 +352,7 @@ def is_wheel_output_contact_col(col: str, prefix: str) -> bool:
         return False
     if not is_wheel_col(col):
         return False
-    return has_any_keyword(col, WHEEL_BASE_CONTACT_KEYWORDS)
+    return has_any_keyword(col, WHEEL_OUTPUT_CONTACT_KEYWORDS)
 
 
 def build_input_groups(base_feature_cols: List[str], proxy_feature_cols: List[str]) -> InputGroupSpec:
@@ -552,6 +585,7 @@ class GroupStandardizer:
         for name, cols in flatten_group_columns(spec).items():
             if len(cols):
                 arr = df[cols].to_numpy(dtype=np.float32)
+                arr = preprocess_input_group_array(df, name, cols, arr)
                 apply_mask = self._build_apply_mask(cols)
             else:
                 arr = np.zeros((len(df), 0), dtype=np.float32)
@@ -572,6 +606,7 @@ class GroupStandardizer:
             return np.zeros((len(df), 0), dtype=np.float32)
 
         arr = df[cols].to_numpy(dtype=np.float32)
+        arr = preprocess_input_group_array(df, group_name, cols, arr)
         return self.scalers[group_name].transform(arr).astype(np.float32)
     def inverse_transform_group(
         self,
@@ -596,6 +631,68 @@ class GroupStandardizer:
             for k, v in state.items()
         }
         return obj
+
+
+def _is_wheel_contact_input_group(group_name: str) -> bool:
+    return group_name.startswith("wheel") and group_name.endswith("_contact")
+
+
+def _get_force_column_indices(cols: List[str]) -> List[int]:
+    indices: List[int] = []
+    for idx, col in enumerate(cols):
+        if col.endswith("Fx") or col.endswith("Fy") or col.endswith("Fz"):
+            indices.append(idx)
+    return indices
+
+
+def _low_pass_filter_series(x: np.ndarray, dt: float, cutoff_hz: float) -> np.ndarray:
+    if x.size == 0 or cutoff_hz <= 0.0 or dt <= 0.0:
+        return x.astype(np.float32, copy=True)
+    rc = 1.0 / (2.0 * math.pi * cutoff_hz)
+    alpha = dt / (rc + dt)
+    y = x.astype(np.float32, copy=True)
+    for t in range(1, y.shape[0]):
+        y[t] = y[t - 1] + alpha * (y[t] - y[t - 1])
+    return y
+
+
+def preprocess_input_group_array(
+    df: pd.DataFrame,
+    group_name: str,
+    cols: List[str],
+    arr: np.ndarray,
+    case_col: str = "case_name",
+    time_col: str = "time",
+    force_cutoff_hz: float = 5.0,
+) -> np.ndarray:
+    if not _is_wheel_contact_input_group(group_name) or len(cols) == 0 or arr.size == 0:
+        return arr
+    force_indices = _get_force_column_indices(cols)
+    if not force_indices or case_col not in df.columns or time_col not in df.columns:
+        return arr
+
+    out = arr.astype(np.float32, copy=True)
+    case_values = df[case_col].astype(str).to_numpy()
+    time_values = df[time_col].to_numpy(dtype=np.float64)
+    start = 0
+    n = len(df)
+    while start < n:
+        end = start + 1
+        case_name = case_values[start]
+        while end < n and case_values[end] == case_name:
+            end += 1
+        if end - start > 1:
+            dt_series = np.diff(time_values[start:end])
+            valid_dt = dt_series[np.isfinite(dt_series) & (dt_series > 0)]
+            dt = float(np.median(valid_dt)) if valid_dt.size > 0 else 0.0
+            for force_idx in force_indices:
+                out[start:end, force_idx] = _low_pass_filter_series(
+                    out[start:end, force_idx],
+                    dt=dt,
+                    cutoff_hz=force_cutoff_hz,
+                )
+        start = end
+    return out
 
 
 def flatten_group_columns(spec: ColumnSpec) -> Dict[str, List[str]]: # 把嵌套的列分组结构展开成一个普通字典。
@@ -627,6 +724,7 @@ def load_merged_dataset(merged_csv_path: str, spec: ColumnSpec, case_col: str = 
     df = pd.read_csv(merged_csv_path)
     if case_col not in df.columns or time_col not in df.columns: # 检查是否包含工况列和时间列
         raise KeyError(f"merged_error_dataset.csv 必须包含 {case_col} 和 {time_col}")
+    df = ensure_time_feature_columns(df, case_col=case_col, time_col=time_col)
     # 检查其他必要列
     check_columns_exist(df, spec.base_feature_cols, "base_feature_cols")
     check_columns_exist(df, spec.proxy_feature_cols, "proxy_feature_cols")
@@ -665,7 +763,11 @@ def extract_group_arrays_from_df(df: pd.DataFrame, spec: ColumnSpec, scaler: Opt
     groups = flatten_group_columns(spec)
     for name, cols in groups.items():
         if scaler is None: # 如果没有 标准化器 scaler，则直接使用原始数据
-            out[name] = df[cols].to_numpy(dtype=np.float32) if len(cols) else np.zeros((len(df), 0), dtype=np.float32)
+            if len(cols):
+                arr = df[cols].to_numpy(dtype=np.float32)
+                out[name] = preprocess_input_group_array(df, name, cols, arr)
+            else:
+                out[name] = np.zeros((len(df), 0), dtype=np.float32)
         else: # 如果有 scaler，则使用 scaler 进行标准化
             out[name] = scaler.transform_group(df, name, cols)
     return out
@@ -717,6 +819,7 @@ class GraphTemporalSequenceDataset(Dataset):
         scaler: Optional[GroupStandardizer],
         seq_len: int = 20,
         pred_horizon: int = 0, # 预测时间步长，0 表示当前时刻，5 表示用过去窗口预测未来第5步
+        pred_seq_len: int = 1, # 未来预测序列长度，1 表示兼容原单步预测
         case_col: str = "case_name",
         time_col: str = "time",
     ):
@@ -725,8 +828,11 @@ class GraphTemporalSequenceDataset(Dataset):
         self.scaler = scaler
         self.seq_len = int(seq_len)
         self.pred_horizon = int(pred_horizon)
+        self.pred_seq_len = int(pred_seq_len)
         self.case_col = case_col
         self.time_col = time_col
+        if self.pred_seq_len < 1:
+            raise ValueError(f"pred_seq_len 必须 >= 1，实际为 {self.pred_seq_len}")
         self.group_arrays = extract_group_arrays_from_df(self.df, self.spec, self.scaler) # 把 DataFrame 转成各组 numpy 数组，并完成标准化
         self.index_map: List[Tuple[int, int]] = [] # 样本索引表。它保存每个样本对应哪个时间点。
         self._build_index() # 会根据每个工况长度自动生成可用样本
@@ -739,7 +845,8 @@ class GraphTemporalSequenceDataset(Dataset):
         start = 0
         for _, sub in self.df.groupby(self.case_col, sort=False):
             n = len(sub)
-            for local_t in range(self.seq_len - 1, n - self.pred_horizon):
+            max_target_end = self.pred_horizon + self.pred_seq_len - 1
+            for local_t in range(self.seq_len - 1, n - max_target_end):
                 self.index_map.append((start, start + local_t)) # start + local_t是每个样本窗口结束点的全局行号
             start += n # 更新起始位置，每个工况在df中的全局位置
             # 每个工况的不同样本存储在index_map中的起始时间步都是start
@@ -750,12 +857,16 @@ class GraphTemporalSequenceDataset(Dataset):
     def _slice_seq(self, arr: np.ndarray, t_global: int) -> np.ndarray: # 根据全局时间戳切片，返回过去 seq_len 步的输入序列
         return arr[t_global - self.seq_len + 1:t_global + 1]
 
+    def _slice_future(self, arr: np.ndarray, target_start_idx: int) -> np.ndarray:
+        return arr[target_start_idx:target_start_idx + self.pred_seq_len]
+
     def __getitem__(self, idx: int) -> Dict[str, Any]: # Dataset 取单个样本
         _, t_global = self.index_map[idx] # 根据样本编号idx找到输入窗口结束位置t_global
-        target_idx = t_global + self.pred_horizon # 计算目标时间戳位置
+        target_start_idx = t_global + self.pred_horizon # 计算目标时间戳起点
+        target_end_idx = target_start_idx + self.pred_seq_len
         sample: Dict[str, Any] = {
-            "case_name": str(self.df.iloc[target_idx][self.case_col]),
-            "time": np.float32(self.df.iloc[target_idx][self.time_col]),
+            "case_name": str(self.df.iloc[target_start_idx][self.case_col]),
+            "time": np.float32(self.df.iloc[target_start_idx][self.time_col]),
         }
 
         for key in ["system", "body"]:
@@ -766,43 +877,51 @@ class GraphTemporalSequenceDataset(Dataset):
             sample[f"wheel{i}_kin"] = torch.from_numpy(self._slice_seq(self.group_arrays[f"wheel{i}_kin"], t_global))
             sample[f"wheel{i}_contact"] = torch.from_numpy(self._slice_seq(self.group_arrays[f"wheel{i}_contact"], t_global))
 
-        # 当前时刻 LF，用于状态重建监督
-        body_lf = self.df.iloc[target_idx][self.lf_body_cols].to_numpy(dtype=np.float32)
+        # 未来 H 步 LF，用于状态重建监督。pred_seq_len=1 时保持 [1, D] 兼容单步目标语义。
+        body_lf = self.df.iloc[target_start_idx:target_end_idx][self.lf_body_cols].to_numpy(dtype=np.float32)
         sample["lf_body_current"] = torch.tensor(body_lf, dtype=torch.float32)
         for i in WHEEL_IDS:
             sample[f"lf_wheel{i}_kin_current"] = torch.tensor(
-                self.df.iloc[target_idx][self.lf_wheel_kin_cols[i]].to_numpy(dtype=np.float32), dtype=torch.float32
+                self.df.iloc[target_start_idx:target_end_idx][self.lf_wheel_kin_cols[i]].to_numpy(dtype=np.float32),
+                dtype=torch.float32,
             )
             sample[f"lf_wheel{i}_contact_current"] = torch.tensor(
-                self.df.iloc[target_idx][self.lf_wheel_contact_cols[i]].to_numpy(dtype=np.float32), dtype=torch.float32
+                self.df.iloc[target_start_idx:target_end_idx][self.lf_wheel_contact_cols[i]].to_numpy(dtype=np.float32),
+                dtype=torch.float32,
             )
 
-        # 标签
+        # 未来 H 步标签
         for key in ["res_body", "hf_body"]:
-            sample[key] = torch.tensor(self.group_arrays[key][target_idx], dtype=torch.float32)
+            sample[key] = torch.tensor(
+                self._slice_future(self.group_arrays[key], target_start_idx),
+                dtype=torch.float32,
+            )
         for i in WHEEL_IDS:
             for key in [f"res_wheel{i}_kin", f"res_wheel{i}_contact", f"hf_wheel{i}_kin", f"hf_wheel{i}_contact"]:
-                sample[key] = torch.tensor(self.group_arrays[key][target_idx], dtype=torch.float32)
+                sample[key] = torch.tensor(
+                    self._slice_future(self.group_arrays[key], target_start_idx),
+                    dtype=torch.float32,
+                )
 
         # =========================================================
         # 前 seq_len - 1 个高保真历史点
         # 用于和当前预测点拼接，计算运动学一致性和平滑性损失
         # =========================================================
         hist_len = self.seq_len - 1
-        hist_start = target_idx - hist_len
-        hist_end = target_idx
+        hist_start = target_start_idx - hist_len
+        hist_end = target_start_idx
 
         if hist_start < 0:
             raise RuntimeError(
-                f"历史序列长度不足: hist_start={hist_start}, target_idx={target_idx}"
+                f"历史序列长度不足: hist_start={hist_start}, target_start_idx={target_start_idx}"
             )
 
-        case_now = self.df.iloc[target_idx][self.case_col]
+        case_now = self.df.iloc[target_start_idx][self.case_col]
         case_hist_start = self.df.iloc[hist_start][self.case_col]
 
         if case_hist_start != case_now:
             raise RuntimeError(
-                f"历史高保真序列跨轨迹: hist_start={hist_start}, target_idx={target_idx}, "
+                f"历史高保真序列跨轨迹: hist_start={hist_start}, target_start_idx={target_start_idx}, "
                 f"case_hist_start={case_hist_start}, case_now={case_now}"
             )
 
@@ -878,6 +997,7 @@ def prepare_datasets_and_scaler(
     merged_csv_path: str,        # 数据CSV文件路径
     seq_len: int = 20,           # 历史序列长度
     pred_horizon: int = 0,       # 预测步长
+    pred_seq_len: int = 1,       # 未来预测序列长度
     case_col: str = "case_name", # 工况列名
     time_col: str = "time",      # 时间列名
     train_ratio: float = 0.7,    # 训练集比例
@@ -893,9 +1013,36 @@ def prepare_datasets_and_scaler(
     # 只用训练集拟合标准化器
     scaler = GroupStandardizer().fit(df_train, spec)
     # 构建训练集
-    train_ds = GraphTemporalSequenceDataset(df_train, spec, scaler, seq_len, pred_horizon, case_col, time_col)
+    train_ds = GraphTemporalSequenceDataset(
+        df_train,
+        spec,
+        scaler,
+        seq_len,
+        pred_horizon,
+        pred_seq_len,
+        case_col,
+        time_col,
+    )
     # 构建验证集
-    val_ds = GraphTemporalSequenceDataset(df_val, spec, scaler, seq_len, pred_horizon, case_col, time_col) if len(df_val) else None
+    val_ds = GraphTemporalSequenceDataset(
+        df_val,
+        spec,
+        scaler,
+        seq_len,
+        pred_horizon,
+        pred_seq_len,
+        case_col,
+        time_col,
+    ) if len(df_val) else None
     # 构建测试集
-    test_ds = GraphTemporalSequenceDataset(df_test, spec, scaler, seq_len, pred_horizon, case_col, time_col) if len(df_test) else None
+    test_ds = GraphTemporalSequenceDataset(
+        df_test,
+        spec,
+        scaler,
+        seq_len,
+        pred_horizon,
+        pred_seq_len,
+        case_col,
+        time_col,
+    ) if len(df_test) else None
     return spec, scaler, df_train, df_val, df_test, train_ds, val_ds, test_ds
