@@ -1094,19 +1094,22 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
     )
     body_lf_att_angle = so3_geodesic_angle(body_rot_lf, body_rot_hf)
     add_no_harm_angle(no_harm_terms, metrics, "body_attitude", body_att_angle, body_lf_att_angle)
-    add_corr_and_gate_raw(
-        corr_terms,
-        gate_terms,
-        metrics,
-        "body",
-        pred_body_raw,
-        pred_body_raw_ungated,
-        batch["lf_body_current"],
-        true_body_raw,
-        scaler_std_tensor(scaler, "hf_body", pred_body_raw),
-        lf_error_tau=trust_lf_error_tau,
-        lf_error_temp=trust_lf_error_temp,
-    )
+    body_non_position = [i for i in range(pred_body_raw.shape[-1]) if i not in body_pos]
+    if body_non_position:
+        add_corr_and_gate_raw(
+            corr_terms,
+            gate_terms,
+            metrics,
+            "body",
+            pred_body_raw,
+            pred_body_raw_ungated,
+            batch["lf_body_current"],
+            true_body_raw,
+            scaler_std_tensor(scaler, "hf_body", pred_body_raw),
+            indices=body_non_position,
+            lf_error_tau=trust_lf_error_tau,
+            lf_error_temp=trust_lf_error_temp,
+        )
     if len(body_pos) == 3:
         body_gate_target = gate_target_from_delta(
             body_delta_pos.detach(), true_body_raw[..., body_pos] - p_prop,
@@ -1177,6 +1180,12 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
                 trust_lf_error_tau, trust_lf_error_temp,
             )
             gate_terms.append(F.smooth_l1_loss(gate_step, gate_target_step.detach()))
+            correction_target_step = batch["rollout_hf_body"][:, step:step + 1, body_pos] - prop_step
+            correction_std = scaler_std_tensor(scaler, "hf_body", lf_step, body_pos)
+            corr_terms.append(F.smooth_l1_loss(
+                (gate_step * delta_step[..., body_pos]) / correction_std,
+                correction_target_step / correction_std,
+            ))
             scaled_final_step = transform_tensor(lf_step.clone().scatter(-1, torch.as_tensor(body_pos, device=lf_step.device).view(1, 1, -1).expand(lf_step.shape[0], 1, -1), final_step), scaler, "hf_body")
             position_terms.append(axis_loss(scaled_final_step[..., body_pos], batch["rollout_hf_body_scaled"][:, step:step + 1, body_pos])[0])
             velocity_terms.append(axis_loss(transform_tensor(lf_step.clone().scatter(-1, torch.as_tensor(body_vel, device=lf_step.device).view(1, 1, -1).expand(lf_step.shape[0], 1, -1), velocity_step), scaler, "hf_body")[..., body_vel], batch["rollout_hf_body_scaled"][:, step:step + 1, body_vel])[0])
@@ -1214,6 +1223,11 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
                 local_target_world_step = (hf_pose_step[..., :3] - lf_pose_step[..., :3]) - true_body_delta_step
                 local_target_body_step = torch.matmul(body_rot_hf_step.transpose(-1, -2), local_target_world_step.unsqueeze(-1)).squeeze(-1)
                 rollout_rocker_local_losses.append(F.smooth_l1_loss(local_step, local_target_body_step))
+                rocker_gate_target_step = gate_target_from_delta(
+                    local_step.detach(), local_target_body_step, None,
+                    trust_lf_error_tau, trust_lf_error_temp,
+                )
+                gate_terms.append(F.smooth_l1_loss(local_gate_step, rocker_gate_target_step.detach()))
             for wheel_id in WHEEL_IDS:
                 lf_wheel_step = batch[f"rollout_lf_wheel{wheel_id}_kin"][:, step:step + 1].float()
                 hf_wheel_step = batch[f"rollout_hf_wheel{wheel_id}_kin"][:, step:step + 1].float()
@@ -1236,6 +1250,11 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
                 local_target_body_step = torch.matmul(body_rot_hf_step.transpose(-1, -2), local_target_world_step.unsqueeze(-1)).squeeze(-1)
                 std_pos_step = torch.as_tensor([scaler.scalers[f"hf_wheel{wheel_id}_kin"].std_[j] for j in wheel_pos_indices], device=lf_step.device, dtype=lf_step.dtype).clamp_min(1e-6)
                 rollout_wheel_local_losses.append(axis_loss(local_step / std_pos_step, local_target_body_step / std_pos_step)[0])
+                wheel_gate_target_step = gate_target_from_delta(
+                    local_step.detach(), local_target_body_step, std_pos_step,
+                    trust_lf_error_tau, trust_lf_error_temp,
+                )
+                gate_terms.append(F.smooth_l1_loss(local_gate_step, wheel_gate_target_step.detach()))
         l_body_p = torch.stack(position_terms).mean()
         l_body_v = torch.stack(velocity_terms).mean()
         body_delta_pos = torch.cat(rollout_delta_positions, dim=1)
@@ -1310,7 +1329,6 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
             hf_pose[..., 0:3],
             pred_pos.new_ones(3),
         )
-        corr_terms.append(F.smooth_l1_loss(pred_pos, hf_pose[..., 0:3]))
         rocker_gate_target = gate_target_from_delta(
             delta_local.detach(), rocker_local_target,
             None, trust_lf_error_tau, trust_lf_error_temp,
@@ -1371,19 +1389,22 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
             true_wheel_raw,
             scaler_std_tensor(scaler, f"hf_wheel{i}_kin", pred_wheel_raw),
         )
-        add_corr_and_gate_raw(
-            corr_terms,
-            gate_terms,
-            metrics,
-            f"wheel{i}_kin",
-            pred_wheel_raw,
-            pred_wheel_raw_ungated,
-            batch[f"lf_wheel{i}_kin_current"],
-            true_wheel_raw,
-            scaler_std_tensor(scaler, f"hf_wheel{i}_kin", pred_wheel_raw),
-            lf_error_tau=trust_lf_error_tau,
-            lf_error_temp=trust_lf_error_temp,
-        )
+        wheel_non_position = [j for j in range(pred_wheel_raw.shape[-1]) if j not in wpos]
+        if wheel_non_position:
+            add_corr_and_gate_raw(
+                corr_terms,
+                gate_terms,
+                metrics,
+                f"wheel{i}_kin",
+                pred_wheel_raw,
+                pred_wheel_raw_ungated,
+                batch[f"lf_wheel{i}_kin_current"],
+                true_wheel_raw,
+                scaler_std_tensor(scaler, f"hf_wheel{i}_kin", pred_wheel_raw),
+                indices=wheel_non_position,
+                lf_error_tau=trust_lf_error_tau,
+                lf_error_temp=trust_lf_error_temp,
+            )
         add_gate_only_raw(
             gate_terms,
             metrics,
@@ -1636,7 +1657,10 @@ def compute_losses_v4(batch, output, spec, scaler, args) -> Dict[str, torch.Tens
     losses["weighted_assembly"] = args.lambda_assembly * l_assembly
     losses["weighted_wheel_local_reg"] = args.lambda_wheel_local_reg * l_wheel_local_reg
     losses["weighted_body_delta_reg"] = getattr(args, "lambda_body_delta_reg", 1e-3) * l_body_delta_reg
-    losses["weighted_body_delta_smooth"] = getattr(args, "lambda_body_delta_smooth", 0.0) * l_body_delta_smooth
+    lambda_body_delta_smooth = float(getattr(args, "lambda_body_delta_smooth", 0.01))
+    if lambda_body_delta_smooth <= 0.0:
+        raise ValueError("lambda_body_delta_smooth must be > 0 for continuous body rollout smoothing")
+    losses["weighted_body_delta_smooth"] = lambda_body_delta_smooth * l_body_delta_smooth
     losses["weighted_force"] = args.lambda_F * l_force
     losses["weighted_phy_state"] = args.lambda_phy_state * l_phy_state
     losses["weighted_force_delta"] = args.lambda_force_delta * l_force_delta
@@ -2021,7 +2045,7 @@ def main() -> None:
     parser.add_argument("--lambda_assembly", type=float, default=0.2)
     parser.add_argument("--lambda_wheel_local_reg", type=float, default=1e-4)
     parser.add_argument("--lambda_body_delta_reg", type=float, default=1e-3)
-    parser.add_argument("--lambda_body_delta_smooth", type=float, default=0.0)
+    parser.add_argument("--lambda_body_delta_smooth", type=float, default=0.01)
     parser.add_argument("--lambda_phy_state", type=float, default=0.0)
     parser.add_argument("--lambda_force_delta", type=float, default=0.0)
     parser.add_argument("--lambda_corr", type=float, default=0.5)
@@ -2049,6 +2073,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.body_rollout_len < 1:
         raise ValueError("--body_rollout_len must be >= 1")
+    if args.lambda_body_delta_smooth <= 0.0:
+        raise ValueError("--lambda_body_delta_smooth must be > 0")
     if args.history_len is None:
         args.history_len = int(args.seq_len) - 1 if args.seq_len is not None else 9
 

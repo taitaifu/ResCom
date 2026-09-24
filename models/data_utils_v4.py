@@ -527,15 +527,6 @@ class GraphTemporalSequenceDatasetV4(_BaseDataset):
             case_col=case_col,
             time_col=time_col,
         )
-        self.index_map = [
-            (start, t) for start, t in self.index_map
-            if t + self.body_rollout_len < len(self.df)
-            and t + self.body_rollout_len + self.teacher_future_len < len(self.df)
-            and all(self.df.iloc[t + step][self.case_col] == self.df.iloc[t][self.case_col]
-                    for step in range(1, self.body_rollout_len + self.teacher_future_len + 1))
-            and all(float(self.df.iloc[t + step][self.time_col]) > float(self.df.iloc[t + step - 1][self.time_col])
-                    for step in range(1, self.body_rollout_len + 1))
-        ]
         self.lf_rocker_pose_cols = {name: rocker_pose_cols(name, "lf") for name in ROCKER_NAMES}
         self.hf_rocker_pose_cols = {name: rocker_pose_cols(name, "hf") for name in ROCKER_NAMES}
         self.lf_body_pose_cols = body_pose_cols("lf")
@@ -672,8 +663,23 @@ class GraphTemporalSequenceDatasetV4(_BaseDataset):
         for _, sub in self.df.groupby(self.case_col, sort=False):
             n = len(sub)
             first_t = self.history_len
-            last_t = n - self.teacher_future_len - 1
-            for local_t in range(first_t, last_t + 1):
+            # A sample predicts the next K rows and each Teacher window may
+            # extend teacher_future_len rows beyond its target. Keep all of
+            # those rows inside this case before adding the sample index.
+            stop_t = n - self.body_rollout_len - self.teacher_future_len
+            if stop_t <= first_t:
+                start += n
+                continue
+
+            candidate_t = np.arange(first_t, stop_t, dtype=np.int64)
+            if self.body_rollout_len > 0 and len(candidate_t):
+                times = sub[self.time_col].to_numpy(dtype=np.float64, copy=False)
+                non_increasing = (np.diff(times) <= 0).astype(np.int64, copy=False)
+                bad_prefix = np.concatenate(([0], np.cumsum(non_increasing, dtype=np.int64)))
+                invalid_count = bad_prefix[candidate_t + self.body_rollout_len] - bad_prefix[candidate_t]
+                candidate_t = candidate_t[invalid_count == 0]
+
+            for local_t in candidate_t:
                 self.index_map.append((start, start + local_t))
             start += n
 

@@ -13,6 +13,7 @@ DEVICE="${DEVICE:-cuda:0}"
 FEATURE_DIR="${FEATURE_DIR:-Feature_Selection/DataSet}"
 MERGED_CSV="${MERGED_CSV:-Feature_Selection/DataSet/merged_error_dataset.csv}"
 V4_SAVE_DIR="${V4_SAVE_DIR:-results_v4}"
+V4_BATCH_SIZE="${V4_BATCH_SIZE:-64}"
 CORRECTOR_EPOCHS="${CORRECTOR_EPOCHS:-40}"
 CORRECTOR_BATCH_SIZE="${CORRECTOR_BATCH_SIZE:-256}"
 CORRECTOR_LR="${CORRECTOR_LR:-1e-3}"
@@ -32,6 +33,7 @@ echo "[Pipeline] Stage A: V4 Teacher"
 "${PYTHON_BIN}" train/train_graph_model_v4.py \
     --train_stage teacher \
     --teacher_future_len 3 \
+    --batch_size "${V4_BATCH_SIZE}" \
     --feature_dir "${FEATURE_DIR}" \
     --merged_csv "${MERGED_CSV}" \
     --save_dir "${V4_SAVE_DIR}" \
@@ -52,6 +54,7 @@ echo "[Pipeline] Stage B: V4 Student"
     --train_stage student \
     --init_ckpt "${TEACHER_CHECKPOINT}" \
     --teacher_future_len 3 \
+    --batch_size "${V4_BATCH_SIZE}" \
     --feature_dir "${FEATURE_DIR}" \
     --merged_csv "${MERGED_CSV}" \
     --save_dir "${V4_SAVE_DIR}" \
